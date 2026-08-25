@@ -3,8 +3,11 @@ numpy
 pyarrow
 matplotlib
 seaborn
-scikit-learn
+scikit-learn>=1.5
 jupyter
 nbformat
 nbclient
 ipykernel
+lightgbm
+catboost
+psutil
