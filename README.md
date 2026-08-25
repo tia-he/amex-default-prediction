@@ -28,10 +28,13 @@ Stratified Validation
 Logistic Regression · LightGBM · CatBoost
         ↓
 AMEX Evaluation Metric
+        ↓
+Feature Ablation & Efficiency Analysis
 ```
 
-This repository currently covers **Phases 1–3**: data understanding, feature engineering,
-and baseline modeling. Each phase is one fully executed, self-contained notebook.
+This repository currently covers **Phases 1–4**: data understanding, feature engineering,
+baseline modeling, and feature ablation. Each phase is one fully executed, self-contained
+notebook.
 
 ## Dataset
 
@@ -154,12 +157,66 @@ Holdout validation results (not Kaggle leaderboard scores):
 | LightGBM | 0.9621 | 0.9242 | 0.6594 | 0.7918 | 170.8s |
 | CatBoost | 0.9626 | 0.9252 | 0.6620 | 0.7936 | 1278.9s |
 
-CatBoost is the strongest current baseline, with LightGBM close behind and training
-substantially faster. Logistic Regression is surprisingly competitive given its much
-simpler functional form — the gap to the tree-based models is real but modest, not a
+CatBoost is the strongest of these three full-feature baselines, with LightGBM close behind
+and training substantially faster. Logistic Regression is surprisingly competitive given its
+much simpler functional form — the gap to the tree-based models is real but modest, not a
 landslide. That's itself informative: it suggests the engineered customer-level features
 already carry substantial linearly-separable predictive structure, and the trees are
 extracting incremental (not transformative) value on top of it.
+
+(Phase 4 later found that a smaller, 852-feature configuration edges out this full-feature
+CatBoost result slightly — see [Feature Ablation](#feature-ablation-phase-4) — but that
++0.0003 difference is within the noise of a single fixed validation split, so it doesn't
+change the qualitative picture above. The more useful Phase 4 finding is about feature
+*efficiency*, not a new leaderboard-topping score.)
+
+## Feature Ablation (Phase 4)
+
+Phase 3's feature importance showed `last`-aggregated features dominating both tree models.
+Phase 4 (`notebooks/04_feature_ablation.ipynb`) turns that observation into a controlled
+question: **how much predictive value comes from a customer's latest financial state versus
+historical summaries, temporal change, and missingness information?** Using LightGBM (close
+to CatBoost in Phase 3, far cheaper to run repeatedly) with Phase 3's exact hyperparameters,
+split, and metric — unchanged across every experiment, so only the feature set varies — six
+additive feature sets were compared:
+
+| Feature Set | # Features | AMEX Metric |
+|---|---|---|
+| Latest only | 180 | 0.7889 |
+| Historical summary only | 672 | 0.7740 |
+| Latest + Historical | 852 | **0.7935** |
+| + Temporal change | 1,188 | 0.7924 |
+| + Missingness | 1,213 | 0.7929 |
+| Full (Phase 3 baseline) | 1,239 | 0.7918 |
+
+**Main findings:**
+
+- A customer's **latest statement alone** — 180 features, 14.5% of the full set — already
+  reaches AMEX 0.7889, close to the full model's 0.7918.
+- **Historical summary statistics alone** (mean/std/min/max, no latest state) are
+  substantially weaker at 0.7740 — recency matters more than long-run averages on their own.
+- **Combining latest state with historical summaries** produced the strongest LightGBM
+  configuration found: AMEX 0.7935 using 852 features — about **31% fewer features than the
+  full 1,239-feature baseline**, while *improving* on its 0.7918.
+- **Adding temporal change** (`first`, `change`) on top of that reduced the metric by about
+  0.0011 — a negligible, slightly negative effect on this split.
+- **Adding the selective `_missing_rate` features** improved the metric by only about
+  +0.0005 — negligible incremental value from the existing (Phase 2, >25%-missingness)
+  selection.
+- **CatBoost confirmation:** re-running CatBoost on just the 852-feature "Latest +
+  Historical" set scored AMEX 0.7939, against 0.7936 for Phase 3's full-feature CatBoost —
+  the same conclusion holds across both model families.
+
+**A caution on the size of these differences:** all of the above comes from a single fixed
+stratified holdout split, not cross-validated across multiple folds. Differences on the
+order of 0.0003–0.0011 are small enough that they shouldn't be read as one configuration
+being definitively better — the meaningful result here is that a substantially smaller
+feature set matches or slightly exceeds the full one, not the exact decimal by which it does
+so.
+
+*Implementation note:* Phase 4 made LightGBM's categorical missing-value handling explicit
+(filling missing categories before training) rather than relying on it happening as a side
+effect of Phase 3's Logistic Regression preprocessing running first in the same notebook.
 
 ## Key Findings
 
@@ -182,6 +239,14 @@ AMEX metric over Logistic Regression by roughly 0.008 — real, but modest relat
 47x difference in training time. None of this implies causation; it describes what these
 particular models weighted heavily on this split, not why default happens.
 
+**More engineered features do not automatically improve default prediction.** Phase 4's
+ablation confirms the pattern the importance rankings hinted at: recent customer state
+carries most of the predictive signal, and historical summary statistics add real,
+complementary value on top of it — but temporal change and missing-rate features, despite
+being part of the full 1,239-feature set, showed little to no incremental value under this
+validation setup. A leaner ~850-feature "latest + historical" set matched or slightly beat
+the full model on both LightGBM and CatBoost.
+
 ## Repository Structure
 
 ```
@@ -189,8 +254,9 @@ amex-default-prediction/
 ├── notebooks/
 │   ├── 01_data_exploration.ipynb       # Phase 1 — EDA
 │   ├── 02_feature_engineering.ipynb    # Phase 2 — customer-level features
-│   └── 03_baseline_modeling.ipynb      # Phase 3 — validation & baselines
-├── figures/                            # exported plots from Phase 1
+│   ├── 03_baseline_modeling.ipynb      # Phase 3 — validation & baselines
+│   └── 04_feature_ablation.ipynb       # Phase 4 — feature ablation
+├── figures/                            # exported plots from Phases 1 & 4
 ├── .gitignore
 ├── README.md
 └── requirements.txt
@@ -222,12 +288,13 @@ Notebooks expect this layout relative to the repository root. Install dependenci
 ## Current Status / Next Steps
 
 **Completed:**
-- Data Understanding & EDA
-- Customer-Level Feature Engineering
-- Baseline Modeling (Logistic Regression, LightGBM, CatBoost)
+- ✅ Phase 1 — Data Understanding & EDA
+- ✅ Phase 2 — Customer-Level Feature Engineering
+- ✅ Phase 3 — Validation & Baseline Modeling
+- ✅ Phase 4 — Feature Ablation & Model Improvement
 
 **Possible future work** (none of the below has been started):
-- Feature ablation (e.g. testing whether the missing-rate features add value)
+- Adopting the reduced ~850-feature "latest + historical" set as the primary feature set
 - Feature-engineering refinement
 - Lightweight hyperparameter tuning
 - Model ensembling
