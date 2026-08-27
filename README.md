@@ -32,11 +32,13 @@ AMEX Evaluation Metric
 Feature Ablation & Efficiency Analysis
         ↓
 Targeted Model Optimization
+        ↓
+Ensemble & Final Model Selection
 ```
 
-This repository currently covers **Phases 1–5**: data understanding, feature engineering,
-baseline modeling, feature ablation, and targeted model optimization. Each phase is one
-fully executed, self-contained notebook.
+This repository currently covers **Phases 1–6**: data understanding, feature engineering,
+baseline modeling, feature ablation, targeted model optimization, and ensemble/final model
+selection. Each phase is one fully executed, self-contained notebook.
 
 ## Dataset
 
@@ -271,6 +273,88 @@ be reproduced in several follow-up attempts — it is **not presented as a valid
 here, only as an unreplicated lead worth revisiting with more stable compute. Further
 retries were intentionally stopped rather than continuing to fight an unstable environment.
 
+## Ensemble & Final Model Selection (Phase 6)
+
+Phase 6 (`notebooks/06_ensemble_and_model_selection.ipynb`) asks a narrower question than
+Phases 3–5: given the two already-tuned Phase 5 models, does a simple weighted blend of
+their saved validation predictions improve on either model alone? No model is retrained in
+this phase — it operates entirely on the two prediction files Phase 5 saved to
+`data/processed/`, explicitly aligned by `customer_ID` (row order is not assumed to match
+between the two files), with both models' AMEX metrics reproduced from those saved files
+before any ensemble analysis:
+
+- Tuned LightGBM (Phase 5): AMEX = **0.79522**
+- CatBoost baseline (Phase 5): AMEX = **0.79391**
+
+**Model complementarity.** The two models are highly correlated but not identical: Pearson
+correlation of raw predicted probabilities is **0.9936**, and Spearman rank correlation is
+**0.9856** — measurably lower, indicating real disagreement in how the two models order
+customers by risk even where their raw scores track closely. A diagnostic comparison of
+each model's own unweighted top-~4%-by-count highest-risk customers (labeled explicitly
+here as a diagnostic ranking check, **not** the official weighted AMEX Top-4% Capture
+metric, which uses sample weights and is reported separately below) found the two models
+agree on **88.9%** of that band (3,262 of 3,671 customers) — leaving roughly **11%** of the
+customers each model calls "highest-risk" disagreeing between them. In short: the models
+are highly correlated but not identical, and the remaining rank disagreement provides
+enough complementary information for a simple blend to improve validation performance.
+
+**Ensemble experiment.** Phase 6 tested simple weighted probability averaging,
+`ensemble = w × LightGBM + (1 − w) × CatBoost`, across a coarse 0.1-increment weight grid
+from `w=0.0` (CatBoost alone) to `w=1.0` (LightGBM alone):
+
+| LGBM Weight | Normalized Gini | Top-4% Capture | AMEX Metric |
+|---|---|---|---|
+| 0.0 (CatBoost only) | 0.9247 | 0.6631 | 0.7939 |
+| 0.5 | 0.9255 | 0.6667 | 0.7961 |
+| **0.6 (selected)** | **0.9255** | **0.6669** | **0.7962** |
+| 0.7 | 0.9254 | 0.6659 | 0.7957 |
+| 1.0 (LightGBM only) | 0.9246 | 0.6658 | 0.7952 |
+
+The strongest coarse-grid result was **60% tuned LightGBM + 40% CatBoost**, AMEX = 0.79621
+— an improvement of **+0.00099** over LightGBM alone and **+0.00230** over CatBoost alone.
+
+Because the two best coarse weights (0.5 and 0.6) were adjacent, a limited 0.05-increment
+local refinement was run around them (per the project's own anti-overfitting rule for this
+phase: no finer than 0.05, and only because the coarse optimum sat in a broad region rather
+than one isolated spike). The refinement's numerical maximum landed at **55% LightGBM / 45%
+CatBoost, AMEX ≈ 0.79627** — but that is only **+0.00006** above the 60/40 result, well
+below this project's own "negligible" threshold (0.0003). **60/40 was kept as the selected
+configuration, not 55/45**, because: the extra refinement gain was negligible; AMEX scores
+across roughly w=0.45–0.65 form a broad plateau rather than depending on one isolated
+weight; and 60/40 is simpler and avoids optimizing the ensemble weight any more finely
+against the same fixed holdout than necessary.
+
+**Metric decomposition.** Unlike Phase 5 — where LightGBM's tuning gain came almost
+entirely from top-4% capture (Gini +0.0005, top-4% +0.0030) — Phase 6's ensemble gain over
+tuned LightGBM was more evenly split between the two AMEX components:
+
+- Normalized Gini: 0.92461 → 0.92550 (Δ +0.00089)
+- Top-4% Capture: 0.66583 → 0.66692 (Δ +0.00109)
+- AMEX Metric: 0.79522 → 0.79621 (Δ +0.00099)
+
+Both components moved by a comparable amount, meaning the ensemble both ranks the overall
+population slightly better *and* concentrates actual defaulters slightly better among its
+highest-risk predictions — not one improvement at the expense of the other.
+
+![Ensemble Weight vs. AMEX Metric](figures/phase6_ensemble_weight_vs_amex.png)
+
+**Final model selection.** The modeling strategy selected for Phase 7 is **60% tuned
+LightGBM + 40% CatBoost** (AMEX = **0.79621**). Despite CatBoost's weaker standalone score,
+it earns a meaningful weight in the blend because it contributes ranking information
+LightGBM's predictions don't fully capture on their own — consistent with the rank
+correlation and high-risk-overlap findings above. This is a controlled validation-holdout
+result, not a claim that the ensemble is proven superior on unseen data.
+
+**Validation caveat (carried forward and strengthened).** Phases 3–6 all evaluate against
+the same fixed 91,783-customer stratified holdout (seed 42) — Phase 3/4 selected the
+feature set against it, Phase 5 tuned LightGBM's hyperparameters against it, and Phase 6 has
+now also chosen an ensemble weight against it. The **+0.00099** ensemble improvement should
+be read as a controlled, same-holdout comparison, not a guarantee of improvement on the
+hidden Kaggle test set. The broad plateau of similarly-strong weights around the selected
+60/40 configuration is reassuring — it suggests the result isn't purely an artifact of one
+lucky weight — but it does not eliminate the underlying risk of validation-set overfitting
+from four phases of decisions made against the same fixed split.
+
 ## Key Findings
 
 **Recent behavior dominates feature importance.** `last`-aggregated features are the large
@@ -308,6 +392,13 @@ better top-4% default capture rather than a large shift in overall Gini, meaning
 model's main advantage is concentrating actual defaults more tightly among the
 highest-risk-ranked customers, not a broad change in how it ranks the full population.
 
+**Blending the two tuned models found genuine, complementary signal, not redundant
+noise.** LightGBM and CatBoost predictions are highly correlated (Pearson 0.9936, Spearman
+0.9856) but disagree enough — roughly 11% of each model's own highest-risk customer band —
+that a simple 60/40 LightGBM/CatBoost blend raised the AMEX metric to **0.79621**, the best
+validated result in this project so far, via balanced gains in both Gini and top-4% capture
+rather than one component alone.
+
 ## Repository Structure
 
 ```
@@ -317,8 +408,9 @@ amex-default-prediction/
 │   ├── 02_feature_engineering.ipynb    # Phase 2 — customer-level features
 │   ├── 03_baseline_modeling.ipynb      # Phase 3 — validation & baselines
 │   ├── 04_feature_ablation.ipynb       # Phase 4 — feature ablation
-│   └── 05_model_optimization.ipynb     # Phase 5 — model optimization
-├── figures/                            # exported plots from Phases 1 & 4
+│   ├── 05_model_optimization.ipynb     # Phase 5 — model optimization
+│   └── 06_ensemble_and_model_selection.ipynb  # Phase 6 — ensemble & final model selection
+├── figures/                            # exported plots from Phases 1, 4 & 6
 ├── .gitignore
 ├── README.md
 └── requirements.txt
@@ -355,9 +447,14 @@ Notebooks expect this layout relative to the repository root. Install dependenci
 - ✅ Phase 3 — Validation & Baseline Modeling
 - ✅ Phase 4 — Feature Ablation & Model Improvement
 - ✅ Phase 5 — Model Optimization
+- ✅ Phase 6 — Ensemble & Final Model Selection
 
-**Possible future work** (none of the below has been started):
+**Overall best validated result:** AMEX = **0.79621** — 60% tuned LightGBM + 40% CatBoost
+ensemble (Phase 6), on the fixed Phase 3–6 validation holdout. See
+[Ensemble & Final Model Selection](#ensemble--final-model-selection-phase-6) for the caveats
+attached to this number.
+
+**Possible future work** (none of the below has been started — this is Phase 7):
+- Test-set inference and Kaggle submission using the selected 60/40 ensemble
 - Revisiting CatBoost tuning in a more stable compute environment
 - Feature-engineering refinement
-- Model ensembling (LightGBM + CatBoost)
-- Final inference / evaluation
