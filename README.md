@@ -30,11 +30,13 @@ Logistic Regression · LightGBM · CatBoost
 AMEX Evaluation Metric
         ↓
 Feature Ablation & Efficiency Analysis
+        ↓
+Targeted Model Optimization
 ```
 
-This repository currently covers **Phases 1–4**: data understanding, feature engineering,
-baseline modeling, and feature ablation. Each phase is one fully executed, self-contained
-notebook.
+This repository currently covers **Phases 1–5**: data understanding, feature engineering,
+baseline modeling, feature ablation, and targeted model optimization. Each phase is one
+fully executed, self-contained notebook.
 
 ## Dataset
 
@@ -218,6 +220,57 @@ so.
 (filling missing categories before training) rather than relying on it happening as a side
 effect of Phase 3's Logistic Regression preprocessing running first in the same notebook.
 
+## Model Optimization (Phase 5)
+
+Phase 5 (`notebooks/05_model_optimization.ipynb`) formally adopted Phase 4's 852-feature
+"Latest + Historical" configuration as the modeling feature set and ran a small, targeted,
+compute-aware optimization pass on LightGBM and CatBoost — deliberately **not** an
+exhaustive grid search or a large-scale Optuna study, in keeping with this project's
+resource constraints (~8GB RAM). All Phase 3–5 comparisons use the same fixed stratified
+holdout split; repeated experimentation against a single holdout risks validation-set
+overfitting, so small metric differences throughout this section are read cautiously
+rather than treated as proof of a better model.
+
+| Model | Configuration | AMEX Metric |
+|---|---|---|
+| LightGBM | Phase 4 baseline (852 features) | 0.7935 |
+| LightGBM | **Tuned** (L1/L2 regularization) | **0.7952** |
+| CatBoost | Phase 4 baseline (852 features) | 0.7939 |
+
+**LightGBM — a confirmed, reproducible improvement.** Seven targeted variations were
+tried (tree complexity, minimum-leaf regularization, stochastic subsampling, L1/L2
+regularization, and combinations of what worked). The best configuration adds L1/L2
+regularization (`reg_alpha=1.0, reg_lambda=1.0`) on top of the Phase 4 baseline
+hyperparameters, raising the AMEX metric from 0.7935 to 0.7952 (**+0.0018**) — reproduced
+twice with a 0.0000 difference between runs.
+
+Decomposed by metric component, the improvement is uneven: normalized Gini moved only
++0.0005, while top-4%-default-capture moved +0.0030. In plain terms, the tuned model
+didn't meaningfully change its overall ranking quality — it got better specifically at
+concentrating actual defaulters among the customers it flags as highest-risk, which is the
+more operationally relevant half of the metric.
+
+One implementation detail surfaced along the way: the baseline's `subsample=0.8` setting
+had been configured without LightGBM's required `subsample_freq`, so row-level subsampling
+had silently never been active in any earlier phase (LightGBM's own documentation:
+`subsample_freq` defaults to 0, meaning "no enable"). Explicitly activating it
+(`subsample_freq=1`) was tested on its own and helped modestly (+0.0006); interestingly,
+combining it with L1/L2 regularization performed slightly worse than L1/L2 alone, so the
+selected configuration uses L1/L2 regularization only.
+
+**CatBoost — inconclusive, reported honestly.** The reproducible 852-feature CatBoost
+baseline remains **AMEX ≈ 0.7939**, unchanged from Phase 4. Every attempt to tune CatBoost
+away from that exact baseline configuration — different tree depth, different
+regularization, different learning rate — was terminated by the local environment during
+training, both when run inside a notebook and as standalone scripts outside Jupyter
+entirely, while the untouched baseline configuration itself completed cleanly every time it
+was tried. This points to an environment-specific instability with non-baseline CatBoost
+runs on this dataset, not a memory shortage or a code defect. One tuning attempt did
+complete before an unrelated interruption and showed a promising result, but it could not
+be reproduced in several follow-up attempts — it is **not presented as a validated result**
+here, only as an unreplicated lead worth revisiting with more stable compute. Further
+retries were intentionally stopped rather than continuing to fight an unstable environment.
+
 ## Key Findings
 
 **Recent behavior dominates feature importance.** `last`-aggregated features are the large
@@ -247,6 +300,14 @@ being part of the full 1,239-feature set, showed little to no incremental value 
 validation setup. A leaner ~850-feature "latest + historical" set matched or slightly beat
 the full model on both LightGBM and CatBoost.
 
+**Targeted tuning produced a further, reproducible gain on top of feature reduction.**
+After adopting the reduced 852-feature set, regularization (and, more incidentally,
+correctly enabling row subsampling) raised LightGBM's AMEX metric from approximately 0.7935
+to 0.7952 — confirmed by an exact reproduction, not a one-off. Most of that gain came from
+better top-4% default capture rather than a large shift in overall Gini, meaning the tuned
+model's main advantage is concentrating actual defaults more tightly among the
+highest-risk-ranked customers, not a broad change in how it ranks the full population.
+
 ## Repository Structure
 
 ```
@@ -255,7 +316,8 @@ amex-default-prediction/
 │   ├── 01_data_exploration.ipynb       # Phase 1 — EDA
 │   ├── 02_feature_engineering.ipynb    # Phase 2 — customer-level features
 │   ├── 03_baseline_modeling.ipynb      # Phase 3 — validation & baselines
-│   └── 04_feature_ablation.ipynb       # Phase 4 — feature ablation
+│   ├── 04_feature_ablation.ipynb       # Phase 4 — feature ablation
+│   └── 05_model_optimization.ipynb     # Phase 5 — model optimization
 ├── figures/                            # exported plots from Phases 1 & 4
 ├── .gitignore
 ├── README.md
@@ -292,10 +354,10 @@ Notebooks expect this layout relative to the repository root. Install dependenci
 - ✅ Phase 2 — Customer-Level Feature Engineering
 - ✅ Phase 3 — Validation & Baseline Modeling
 - ✅ Phase 4 — Feature Ablation & Model Improvement
+- ✅ Phase 5 — Model Optimization
 
 **Possible future work** (none of the below has been started):
-- Adopting the reduced ~850-feature "latest + historical" set as the primary feature set
+- Revisiting CatBoost tuning in a more stable compute environment
 - Feature-engineering refinement
-- Lightweight hyperparameter tuning
-- Model ensembling
+- Model ensembling (LightGBM + CatBoost)
 - Final inference / evaluation
