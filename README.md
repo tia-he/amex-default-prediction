@@ -14,6 +14,40 @@ project works through.
 **Central question:** can a customer's longitudinal financial behavior be transformed into
 useful customer-level signals for predicting future default?
 
+## At a Glance
+
+- **Problem:** longitudinal credit-default prediction — one row per customer, aggregated
+  from up to 13 monthly account statements, not a single snapshot.
+- **Dataset:** Kaggle's [American Express - Default Prediction](https://www.kaggle.com/competitions/amex-default-prediction) — ~16.4GB raw training data + 33.82GB raw test data,
+  roughly **50GB** combined.
+- **Constraint:** processed entirely on an **~8GB-RAM** development machine via chunked,
+  customer-boundary-safe streaming aggregation — no raw file was ever loaded whole.
+- **Modeling:** LightGBM + CatBoost, feature-reduced from 1,239 to 852 engineered features,
+  blended as a fixed 60% LightGBM / 40% CatBoost ensemble.
+- **Result:**
+
+| Evaluation | AMEX Metric |
+|---|---|
+| Local validation (fixed holdout) | 0.79621 |
+| Kaggle Public leaderboard | 0.79308 |
+| Kaggle Private leaderboard | 0.80098 |
+
+These three numbers come from different data (one fixed local holdout, two different
+hidden Kaggle splits) and are kept explicitly distinct everywhere in this README — none of
+them substitutes for another.
+
+**Progression** (exact figures, verified from each phase's executed notebook — not every
+minor experiment, just the throughline):
+
+| Stage | Configuration | Evaluation | AMEX Metric |
+|---|---|---|---|
+| Baseline | CatBoost, full 1,239 features (Phase 3) | Local validation | 0.7936 |
+| Feature ablation | LightGBM, reduced 852 features (Phase 4) | Local validation | 0.7935 |
+| Tuning | LightGBM, L1/L2 regularization (Phase 5) | Local validation | 0.79522 |
+| Ensemble | 60% LightGBM + 40% CatBoost (Phase 6) | Local validation | 0.79621 |
+| Final model → hidden test | same 60/40 ensemble, full-data retrain (Phase 7) | Kaggle Public | 0.79308 |
+| Final model → hidden test | same 60/40 ensemble, full-data retrain (Phase 7) | Kaggle Private | 0.80098 |
+
 ## Project Overview
 
 ```
@@ -36,12 +70,15 @@ Targeted Model Optimization
 Ensemble & Final Model Selection
         ↓
 Full-Data Retraining, Test Inference & Submission
+        ↓
+Model Interpretation & Project Polish
 ```
 
-This repository currently covers **Phases 1–7**: data understanding, feature engineering,
-baseline modeling, feature ablation, targeted model optimization, ensemble/final model
-selection, and full-data retraining with unseen-test inference. Each phase is one fully
-executed, self-contained notebook.
+This repository covers **Phases 1–8**: data understanding, feature engineering, baseline
+modeling, feature ablation, targeted model optimization, ensemble/final model selection,
+full-data retraining with unseen-test inference and Kaggle submission, and final model
+interpretation. Each phase is one fully executed, self-contained notebook — this is now
+the completed, final state of the project.
 
 ## Dataset
 
@@ -195,6 +232,8 @@ additive feature sets were compared:
 | + Temporal change | 1,188 | 0.7924 |
 | + Missingness | 1,213 | 0.7929 |
 | Full (Phase 3 baseline) | 1,239 | 0.7918 |
+
+![Feature Count vs. AMEX Metric Across Ablation Experiments](figures/phase4_feature_efficiency.png)
 
 **Main findings:**
 
@@ -438,8 +477,11 @@ test labels exist locally to compute one.
 `customer_ID, prediction`. Before saving, the pipeline verified: the customer_ID set matches
 `sample_submission.csv` exactly, the row count matches, IDs are unique, there are no missing
 or infinite predictions, all probabilities fall in [0, 1], and the saved CSV reloads
-identically to the validated in-memory version. **Generating this file is not the same as
-submitting it** — as of this update, the submission has not been uploaded to Kaggle.
+identically to the validated in-memory version. Generating this file was a separate step
+from submitting it — Phase 7 itself stopped at the validated local file; the submission was
+subsequently uploaded to Kaggle and scored **0.79308 (Public)** / **0.80098 (Private)**,
+against the **0.79621** local validation figure above (see [Key Findings](#key-findings) for
+how these three numbers relate).
 
 **Runtime / resource summary.** All real Phase 7 computation ran sequentially (never both
 models training at once), completing in roughly **38 minutes** total:
@@ -466,49 +508,112 @@ schema-validated before reuse. Expensive feature-engineering output was checkpoi
 validated before reuse, which meant a later resumed run could pick up downstream
 training/inference directly rather than repeating the raw-data scan.
 
+## Model Interpretation (Phase 8)
+
+Phase 8 (`notebooks/08_model_interpretation.ipynb`) is a read-only analysis pass over the
+Phase 7 final production models — **no model was retrained.** Both `phase7_final_lightgbm.txt`
+and `phase7_final_catboost.cbm` already contain enough information (tree structure, split
+statistics, feature names) to compute feature importance without touching the training data
+again, so this phase loads those two persisted model files directly.
+
+**Top individual features.** Ranked by the mean of each model's own normalized importance
+share (LightGBM's split-gain and CatBoost's `PredictionValuesChange` importance are on
+different scales, so each is rescaled to sum to 100% before comparing them). `P_2_last`
+remains the single dominant feature in both models individually — consistent with Phase 3's
+finding on the full 1,239-feature model — at roughly 49% of LightGBM's total importance and
+10% of CatBoost's. Per this project's anonymized-feature policy, `P_2_last` is described
+only structurally, as *the latest observed value of anonymized Payment-family feature P_2*
+— no business meaning (e.g. "payment ratio") is assumed, since the competition does not
+publicly define it.
+
+**Feature-family importance** separates two different questions: which family carries the
+most importance overall, and which family's features are individually most informative.
+
+![Feature-Family Importance](figures/phase8_family_importance.png)
+
+Delinquency (`D_`) and Balance (`B_`) carry the largest *total* importance largely because
+they contain the most features (414 and 178 of the 852, respectively) — but Payment (`P_`),
+with only 15 features, has by far the highest importance *per feature*, almost entirely on
+the strength of `P_2_last`.
+
+**Temporal-representation importance** is one of the more direct checks on Phase 4's own
+ablation findings:
+
+![Temporal-Representation Importance](figures/phase8_representation_importance.png)
+
+`last`/`categorical_last` features (latest customer state) account for roughly **63%** of
+combined normalized importance, versus **37%** for the historical summary aggregates
+(`mean`/`std`/`min`/`max`) — directionally consistent with Phase 4's controlled ablation
+result that latest-state features are the strongest single group, while historical
+summaries still add real, non-trivial value on top of them. Phase 4 also found that
+temporal-*change* and missing-rate features added negligible-to-slightly-negative
+validation value and excluded them from the 852-feature set entirely; this importance
+analysis can't re-confirm that directly (those features aren't part of the final models at
+all), but nothing here suggests the reduced set is missing an important signal source. Among
+the top 20 features by importance, 15 use `last`/`categorical_last` and 5 use a historical
+summary statistic — the same latest-state-dominant, summary-still-matters pattern holds at
+the top of the ranking, not just in the aggregate.
+
+**Interpretation limitations:** AMEX's raw features are anonymized, so no business-semantic
+meaning is claimed beyond each feature's structural description; feature importance
+reflects predictive/split contribution, not causality; importance can be split across
+correlated engineered features derived from the same raw signal (a feature's `mean`, `min`,
+and `max` are often correlated); and tree-based importance metrics can be influenced by
+feature structure (e.g. numeric vs. categorical) independent of true information content.
+For these reasons, this analysis emphasizes family- and representation-level patterns,
+which are more robust to these effects than any single feature's exact rank.
+
 ## Key Findings
 
-**Recent behavior dominates feature importance.** `last`-aggregated features are the large
-majority of both models' top 20 by importance — 13 of 20 for LightGBM, 15 of 20 for
-CatBoost. A customer's most recent statement appears markedly more informative than their
-historical average.
+**A. Latest customer state matters strongly, and historical summaries add real incremental
+value on top of it.** A customer's most recent statement is consistently the single
+strongest signal group — `P_2_last` alone accounts for roughly half of LightGBM's total
+importance and remains the top individual feature in both final models (Phase 8), matching
+what Phase 3 first observed on the full 1,239-feature baseline. But this isn't the whole
+story: Phase 4's ablation showed latest-state-only features (AMEX 0.7889) improve further
+once historical summary statistics are added (0.7935), and Phase 8's importance analysis
+found the same split directionally — latest-state representations carry ~63% of combined
+importance, historical summaries ~37%, not 100/0.
 
-**Payment behavior is the single strongest signal.** `P_2_last` ranks #1 in both LightGBM's
-and CatBoost's feature importance, by a wide margin. (`P_2`'s specific business definition
-isn't established in the dataset documentation available to this project, so no semantic
-claim is made beyond what the ranking itself shows.)
+**B. More engineered features were not automatically better.** Reducing from the full
+1,239-feature representation to a leaner 852-feature "Latest + Historical" set (Phase 4)
+matched — and, on this fixed split, slightly exceeded — full-model validation performance
+on both LightGBM and CatBoost, while cutting training time and feature count substantially.
 
-**Balance and delinquency features appear frequently.** `B_` and `D_` prefixed features
-make up the majority of both models' top-20 lists, alongside a smaller but consistent
-presence of `R_` (risk) features.
+**C. Explicit temporal-change features were not useful here.** Adding `first`/`change`
+features on top of latest-state-plus-historical-summary features reduced the validation
+AMEX metric by about 0.0011 (Phase 4) — a negligible, slightly negative effect on this
+dataset and split, not a generalizable claim that trend features never help.
 
-**Model complexity yields incremental, not transformative, gains.** CatBoost improves the
-AMEX metric over Logistic Regression by roughly 0.008 — real, but modest relative to the
-47x difference in training time. None of this implies causation; it describes what these
-particular models weighted heavily on this split, not why default happens.
+**D. Missingness engineering added little.** The selective `_missing_rate` features
+(Phase 2's >25%-missing threshold) improved the metric by only about +0.0005 (Phase 4) —
+negligible incremental value from that specific engineering choice on this dataset.
 
-**More engineered features do not automatically improve default prediction.** Phase 4's
-ablation confirms the pattern the importance rankings hinted at: recent customer state
-carries most of the predictive signal, and historical summary statistics add real,
-complementary value on top of it — but temporal change and missing-rate features, despite
-being part of the full 1,239-feature set, showed little to no incremental value under this
-validation setup. A leaner ~850-feature "latest + historical" set matched or slightly beat
-the full model on both LightGBM and CatBoost.
+**E. Regularization was what improved LightGBM, not more complexity.** Phase 5's tuned
+LightGBM (L1/L2 regularization, plus incidentally fixing an inactive row-subsampling
+setting) raised the AMEX metric from 0.7935 to 0.79522 — a reproducible gain driven mainly
+by better top-4% default capture, not a broad change in overall ranking quality.
 
-**Targeted tuning produced a further, reproducible gain on top of feature reduction.**
-After adopting the reduced 852-feature set, regularization (and, more incidentally,
-correctly enabling row subsampling) raised LightGBM's AMEX metric from approximately 0.7935
-to 0.7952 — confirmed by an exact reproduction, not a one-off. Most of that gain came from
-better top-4% default capture rather than a large shift in overall Gini, meaning the tuned
-model's main advantage is concentrating actual defaults more tightly among the
-highest-risk-ranked customers, not a broad change in how it ranks the full population.
+**F. CatBoost added ensemble value despite weaker standalone performance.** LightGBM and
+CatBoost predictions are highly correlated (Pearson 0.9936, Spearman 0.9856) but disagree
+enough — roughly 11% of each model's own highest-risk customer band — that a 60/40
+LightGBM/CatBoost blend raised local validation AMEX to 0.79621 (Phase 6), via balanced
+gains in both Gini and top-4% capture rather than one component alone.
 
-**Blending the two tuned models found genuine, complementary signal, not redundant
-noise.** LightGBM and CatBoost predictions are highly correlated (Pearson 0.9936, Spearman
-0.9856) but disagree enough — roughly 11% of each model's own highest-risk customer band —
-that a simple 60/40 LightGBM/CatBoost blend raised the AMEX metric to **0.79621**, the best
-validated result in this project so far, via balanced gains in both Gini and top-4% capture
-rather than one component alone.
+**G. Hidden-test generalization remained in a broadly similar range, with no evidence of
+catastrophic failure.** The same 60/40 ensemble, retrained on 100% of labeled data and
+submitted to Kaggle (Phase 7), scored **0.79308** on the Public leaderboard and **0.80098**
+on the Private leaderboard, against **0.79621** on local validation. Public and Private
+differ from local validation by a small amount in opposite directions; since all three are
+different samples, a Private score above local validation is not evidence the model
+"improved," and this is not treated as a stronger generalization claim than "results stayed
+in the same general range."
+
+**Model complexity yielded incremental, not transformative, gains.** CatBoost's full-feature
+baseline improved on Logistic Regression's AMEX metric by roughly 0.008 (Phase 3) — real,
+but modest relative to the 47x difference in training time. None of this implies causation;
+it describes what these particular models weighted heavily on this data, not why default
+happens.
 
 **The full pipeline scaled cleanly from an 80% validation slice to a full ~50GB production
 run.** Retraining the frozen Phase 6 pipeline on all 458,913 labeled customers and
@@ -517,6 +622,24 @@ data — completed in about 38 minutes on the same ~8GB-RAM machine used through
 project, via the same boundary-safe streaming approach validated back in Phase 2. This is
 an operational result, not a new score: it confirms the earlier phases' modeling choices
 run end-to-end at full scale, not just on the 80% slice they were validated on.
+
+## Limitations
+
+- **Anonymized features limit business interpretation.** AMEX's raw feature names carry no
+  public business definition, so this project interprets structure (temporal
+  representation, feature family) rather than assumed semantics (see [Model Interpretation](#model-interpretation-phase-8)).
+- **Phases 3–6 reused one fixed validation holdout.** Feature selection, hyperparameter
+  tuning, and ensemble-weight selection were all evaluated against the same 91,783-customer
+  split, which carries some validation-selection risk despite the broad-plateau evidence
+  found in Phase 6.
+- **Kaggle's hidden-test scores are useful external evidence, not a substitute for repeated
+  or temporal out-of-time validation.** A single Public/Private split confirms results stayed
+  in a similar range; it does not rule out the kind of drift that repeated or time-based
+  validation would be needed to detect.
+- **This solution prioritizes a clear, reproducible portfolio pipeline over
+  leaderboard-maximizing techniques** — e.g. no stacking, no pseudo-labeling, no large
+  hyperparameter search, consistent with the project's stated resource constraints and
+  goals throughout.
 
 ## Repository Structure
 
@@ -529,9 +652,10 @@ amex-default-prediction/
 │   ├── 04_feature_ablation.ipynb       # Phase 4 — feature ablation
 │   ├── 05_model_optimization.ipynb     # Phase 5 — model optimization
 │   ├── 06_ensemble_and_model_selection.ipynb  # Phase 6 — ensemble & final model selection
-│   └── 07_final_training_and_inference.ipynb  # Phase 7 — full training & test inference
-├── figures/                            # exported plots from Phases 1, 4 & 6
-├── submissions/                        # Kaggle-ready submission (Phase 7; not yet uploaded)
+│   ├── 07_final_training_and_inference.ipynb  # Phase 7 — full training & test inference
+│   └── 08_model_interpretation.ipynb    # Phase 8 — model interpretation & polish
+├── figures/                            # exported plots from Phases 1, 4, 6 & 8
+├── submissions/                        # Kaggle-ready submission (Phase 7)
 ├── .gitignore
 ├── README.md
 └── requirements.txt
@@ -558,30 +682,39 @@ data/
 ```
 
 Notebooks expect this layout relative to the repository root. Install dependencies with
-`pip install -r requirements.txt`.
+`pip install -r requirements.txt`. Processed artifacts and checkpoints (`data/processed/`)
+are likewise not tracked and are regenerated by running the notebooks in order — the eight
+notebooks in `notebooks/` are the complete, self-contained record of the workflow. Cloning
+this repository alone does not reproduce the project end-to-end: Kaggle competition access
+is required to obtain the raw data before any notebook can run.
 
-## Current Status / Next Steps
+## Project Status
 
-**Completed:**
+**This project is complete, through Phase 8:**
 - ✅ Phase 1 — Data Understanding & EDA
 - ✅ Phase 2 — Customer-Level Feature Engineering
 - ✅ Phase 3 — Validation & Baseline Modeling
 - ✅ Phase 4 — Feature Ablation & Model Improvement
 - ✅ Phase 5 — Model Optimization
 - ✅ Phase 6 — Ensemble & Final Model Selection
-- ✅ Phase 7 — Full Training, Test Inference & Kaggle Submission Preparation
+- ✅ Phase 7 — Full Training, Test Inference & Kaggle Submission
+- ✅ Phase 8 — Model Interpretation & Project Polish
 
-**Overall best validated result:** AMEX = **0.79621** — 60% tuned LightGBM + 40% CatBoost
-ensemble (Phase 6), on the fixed Phase 3–6 validation holdout. See
-[Ensemble & Final Model Selection](#ensemble--final-model-selection-phase-6) for the caveats
-attached to this number. Phase 7 has no corresponding test-set score, since no ground-truth
-test labels exist locally — this validation figure remains the project's best available
-estimate of hidden-test performance.
+**Final results**, kept explicitly distinct (see [Key Findings](#key-findings) for how they
+relate):
 
-A Kaggle-ready submission (`submissions/submission.csv`, 924,621 predictions) has been
-generated and validated, but **has not yet been uploaded to Kaggle**.
+| Evaluation | AMEX Metric |
+|---|---|
+| Local validation (Phase 6, fixed holdout) | 0.79621 |
+| Kaggle Public leaderboard (Phase 7) | 0.79308 |
+| Kaggle Private leaderboard (Phase 7) | 0.80098 |
 
-**Possible future work** (none of the below has been started):
-- Submitting the generated predictions to Kaggle and recording the resulting score
+The Kaggle-ready submission (`submissions/submission.csv`, 924,621 predictions) generated
+in Phase 7 has been uploaded to Kaggle and scored, as shown above.
+
+**Possible future extensions** (optional — none required for this project to be considered
+complete):
 - Revisiting CatBoost tuning in a more stable compute environment
 - Feature-engineering refinement
+- Repeated or temporal out-of-time validation, to more directly test the validation-holdout
+  risk noted in [Limitations](#limitations)
