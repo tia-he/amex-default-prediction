@@ -34,11 +34,14 @@ Feature Ablation & Efficiency Analysis
 Targeted Model Optimization
         ↓
 Ensemble & Final Model Selection
+        ↓
+Full-Data Retraining, Test Inference & Submission
 ```
 
-This repository currently covers **Phases 1–6**: data understanding, feature engineering,
-baseline modeling, feature ablation, targeted model optimization, and ensemble/final model
-selection. Each phase is one fully executed, self-contained notebook.
+This repository currently covers **Phases 1–7**: data understanding, feature engineering,
+baseline modeling, feature ablation, targeted model optimization, ensemble/final model
+selection, and full-data retraining with unseen-test inference. Each phase is one fully
+executed, self-contained notebook.
 
 ## Dataset
 
@@ -355,6 +358,114 @@ hidden Kaggle test set. The broad plateau of similarly-strong weights around the
 lucky weight — but it does not eliminate the underlying risk of validation-set overfitting
 from four phases of decisions made against the same fixed split.
 
+## Full Training, Test Inference & Kaggle Submission (Phase 7)
+
+Phase 7 (`notebooks/07_final_training_and_inference.ipynb`) is an **execution phase, not a
+model-development phase**. Phases 3–6 selected the feature representation, model
+configurations, and ensemble weights against a fixed validation holdout; Phase 7 freezes
+every one of those decisions, retrains the selected models on the full labeled population,
+processes the unseen competition test set, and produces the final Kaggle-ready predictions.
+No feature selection, hyperparameter tuning, or ensemble-weight search happens in this
+phase.
+
+**Large-scale data pipeline.** The combined raw workflow — **~16.4GB** of training data plus
+**33.82GB** of test data, roughly **50GB** total — comfortably exceeds the ~8GB of RAM
+available on the development machine, so neither raw file is ever loaded whole. Test feature
+engineering reuses Phase 2's proven approach: chunked CSV reads, customer-boundary-safe
+streaming aggregation (verified against a direct, non-chunked aggregation on a slice before
+running the full pass), and a checkpointed customer-level Parquet output. The 33.82GB raw
+test CSV — **11,363,762** rows, **924,621** customers — required exactly **one** full
+streaming pass across the entire Phase 7 exercise, completed in about **4 minutes**, with the
+resulting `data/processed/test_features.parquet` (924,621 customers × 852 features,
+~3.32GB) validated and reused by every subsequent run rather than rescanning the raw file
+again. This is a memory-efficient local streaming pipeline, not a distributed or big-data
+system — but processing roughly 50GB of longitudinal credit data end-to-end on an ~8GB-RAM
+machine is itself a meaningful engineering result for this project.
+
+**Final feature representation.** Phase 7 reuses Phase 4's reduced 852-feature "Latest +
+Historical" representation unmodified — the same latest-value, historical-summary, and
+categorical latest-value features selected in Phase 4, not a new feature set. Before any
+model touched the test data, the pipeline validated an exact 852/852 feature-name match
+between train and test, compatible feature schema/ordering, zero infinite values, and — for
+this dataset, on this train/test split — no categorical level appearing in test that wasn't
+already observed in the full training set. That last result is an empirical property of this
+specific dataset, not a general guarantee.
+
+**Full-data training.** Both final models were retrained on all **458,913** labeled training
+customers — not the 80% split used in Phases 3–6 — with no new validation split created and
+no test information used for model selection. Since full-data training has no held-out data
+for early stopping, each model's boosting-round count was instead derived by scaling its
+Phase 5 validated best-iteration count by the training-set-size ratio (367,130 → 458,913, a
+×1.25 scale factor) — a mechanical adjustment, not a new tuning decision:
+
+| Model | Phase 5 validated best-iteration | Phase 7 final rounds |
+|---|---|---|
+| LightGBM | 924 | **1,155** |
+| CatBoost | 1,530 | **1,913** |
+
+**Final LightGBM.** Exact Phase 5 winning configuration — `learning_rate=0.05,
+num_leaves=31, subsample=0.8, colsample_bytree=0.8, reg_alpha=1.0, reg_lambda=1.0` — with
+only the boosting-round count changed, to **1,155**. Training on 458,913 customers took
+approximately **4.3 minutes**; generating predictions for all 924,621 test customers took
+approximately **76 seconds**. (Phase 5's validated holdout AMEX of 0.79522 is what motivated
+this configuration's selection — it is not a Phase 7 test score; Phase 7 has no way to
+compute an AMEX metric at all, since the competition's ground-truth test labels aren't
+available locally.)
+
+**Final CatBoost.** Exact Phase 5 reproducible baseline configuration — `learning_rate=0.05,
+depth=6, loss_function=Logloss` — with iterations increased to **1,913** and no early
+stopping (there is no held-out set left to stop against). Given the CatBoost training
+instability documented in Phase 5, this full-data run was treated as a single production
+attempt rather than an experiment: it completed successfully on the **first attempt**,
+training in approximately **26.8 minutes** and predicting all 924,621 test customers in
+about **7.3 seconds**.
+
+**Final ensemble.** Phase 7 applies the Phase 6 selected weights exactly, with no
+re-optimization:
+
+```
+final_prediction = 0.60 × LightGBM + 0.40 × CatBoost
+```
+
+No new weight search was run against test data, and no rank averaging or other
+post-processing was introduced. The **0.79621** AMEX figure associated with this 60/40
+configuration is the **Phase 6 validation result**, on the same fixed holdout used
+throughout Phases 3–6 — Phase 7 has no corresponding test-set score, since no ground-truth
+test labels exist locally to compute one.
+
+**Submission.** The blended predictions were written to a Kaggle-ready submission for all
+924,621 test customers, using the exact schema of the local `sample_submission.csv`:
+`customer_ID, prediction`. Before saving, the pipeline verified: the customer_ID set matches
+`sample_submission.csv` exactly, the row count matches, IDs are unique, there are no missing
+or infinite predictions, all probabilities fall in [0, 1], and the saved CSV reloads
+identically to the validated in-memory version. **Generating this file is not the same as
+submitting it** — as of this update, the submission has not been uploaded to Kaggle.
+
+**Runtime / resource summary.** All real Phase 7 computation ran sequentially (never both
+models training at once), completing in roughly **38 minutes** total:
+
+| Stage | Runtime |
+|---|---|
+| Test feature engineering (one streaming pass) | ~4 min |
+| Final LightGBM training | ~4.3 min |
+| LightGBM inference (924,621 customers) | ~76 sec |
+| Final CatBoost training | ~26.8 min |
+| CatBoost inference (924,621 customers) | ~7 sec |
+
+Observed process RSS stayed below roughly 1GB at every checkpoint printed during
+execution — a statement about this process's own memory footprint, not total system memory
+— and the run completed without an out-of-memory failure. Put plainly: the complete ~50GB
+raw-data workflow was feasible end-to-end on an ~8GB-RAM machine, without ever loading a
+full raw file into memory, using the same boundary-safe streaming approach established in
+Phase 2.
+
+**Checkpointing.** Because Phase 7 involves genuinely expensive steps (a 30GB+ file scan,
+tens of minutes of full-data training), intermediate artifacts — the processed test feature
+table, the trained model files, and each model's test predictions — are saved and
+schema-validated before reuse. Expensive feature-engineering output was checkpointed and
+validated before reuse, which meant a later resumed run could pick up downstream
+training/inference directly rather than repeating the raw-data scan.
+
 ## Key Findings
 
 **Recent behavior dominates feature importance.** `last`-aggregated features are the large
@@ -399,6 +510,14 @@ that a simple 60/40 LightGBM/CatBoost blend raised the AMEX metric to **0.79621*
 validated result in this project so far, via balanced gains in both Gini and top-4% capture
 rather than one component alone.
 
+**The full pipeline scaled cleanly from an 80% validation slice to a full ~50GB production
+run.** Retraining the frozen Phase 6 pipeline on all 458,913 labeled customers and
+processing the entire 924,621-customer unseen test set — combined, roughly 50GB of raw
+data — completed in about 38 minutes on the same ~8GB-RAM machine used throughout the
+project, via the same boundary-safe streaming approach validated back in Phase 2. This is
+an operational result, not a new score: it confirms the earlier phases' modeling choices
+run end-to-end at full scale, not just on the 80% slice they were validated on.
+
 ## Repository Structure
 
 ```
@@ -409,8 +528,10 @@ amex-default-prediction/
 │   ├── 03_baseline_modeling.ipynb      # Phase 3 — validation & baselines
 │   ├── 04_feature_ablation.ipynb       # Phase 4 — feature ablation
 │   ├── 05_model_optimization.ipynb     # Phase 5 — model optimization
-│   └── 06_ensemble_and_model_selection.ipynb  # Phase 6 — ensemble & final model selection
+│   ├── 06_ensemble_and_model_selection.ipynb  # Phase 6 — ensemble & final model selection
+│   └── 07_final_training_and_inference.ipynb  # Phase 7 — full training & test inference
 ├── figures/                            # exported plots from Phases 1, 4 & 6
+├── submissions/                        # Kaggle-ready submission (Phase 7; not yet uploaded)
 ├── .gitignore
 ├── README.md
 └── requirements.txt
@@ -448,13 +569,19 @@ Notebooks expect this layout relative to the repository root. Install dependenci
 - ✅ Phase 4 — Feature Ablation & Model Improvement
 - ✅ Phase 5 — Model Optimization
 - ✅ Phase 6 — Ensemble & Final Model Selection
+- ✅ Phase 7 — Full Training, Test Inference & Kaggle Submission Preparation
 
 **Overall best validated result:** AMEX = **0.79621** — 60% tuned LightGBM + 40% CatBoost
 ensemble (Phase 6), on the fixed Phase 3–6 validation holdout. See
 [Ensemble & Final Model Selection](#ensemble--final-model-selection-phase-6) for the caveats
-attached to this number.
+attached to this number. Phase 7 has no corresponding test-set score, since no ground-truth
+test labels exist locally — this validation figure remains the project's best available
+estimate of hidden-test performance.
 
-**Possible future work** (none of the below has been started — this is Phase 7):
-- Test-set inference and Kaggle submission using the selected 60/40 ensemble
+A Kaggle-ready submission (`submissions/submission.csv`, 924,621 predictions) has been
+generated and validated, but **has not yet been uploaded to Kaggle**.
+
+**Possible future work** (none of the below has been started):
+- Submitting the generated predictions to Kaggle and recording the resulting score
 - Revisiting CatBoost tuning in a more stable compute environment
 - Feature-engineering refinement
